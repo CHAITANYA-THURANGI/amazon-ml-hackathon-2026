@@ -64,3 +64,5 @@ logs/
 # Keep output/ tracked but ignore large intermediates
 output/*.pkl
 output/*.parquet
+*_submission/
+scratch/

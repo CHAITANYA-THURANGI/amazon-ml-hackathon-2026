@@ -3,20 +3,36 @@
 ## Prerequisites
 
 - Python 3.9+
-- ~8 GB RAM recommended (dataset is large)
+- NVIDIA GPU (RTX 4060 or any CUDA GPU) supported automatically
+- CPU fallback supported automatically on any system without code changes
 
-## Setup
+## Execution Modes (Universal GPU & CPU)
+
+### 1. GPU Mode (Default on your Laptop)
+The pipeline automatically detects your **NVIDIA GeForce RTX 4060 Laptop GPU** and uses:
+- **CUDA 12.8 / 13.3 GPU acceleration** for model training (`tree_method='hist'`, `device='cuda'`)
+- Model training executes in **~1 second** on GPU!
 
 ```bash
-# From the project root
-python -m venv venv
-venv\Scripts\activate          # Windows
-pip install -r code/business_entity_resolution/requirements.txt
+# Auto-detects GPU and runs full pipeline:
+python code/business_entity_resolution/src/pipeline.py
 ```
 
-## Dataset
+### 2. CPU Mode (Universal fallback)
+If you want to force CPU execution (or on systems without a GPU):
 
-Ensure the dataset is placed at `dataset/` relative to the project root:
+```bash
+python code/business_entity_resolution/src/pipeline.py --device cpu
+```
+
+### 3. Quick Verification Test
+To verify the entire pipeline runs without waiting for all 1.7M test entities:
+
+```bash
+python code/business_entity_resolution/src/pipeline.py --quick-test
+```
+
+## Dataset Structure
 
 ```
 dataset/
@@ -31,42 +47,19 @@ dataset/
     └── test_source3.tsv
 ```
 
-## Run End-to-End Pipeline
+## Output Files
+
+The pipeline generates the two required competition files in `output/`:
+1. `output/matching_results.tsv` — Final entity matches for portal leaderboard upload.
+2. `output/candidate_pairs.tsv` — Candidate pairs from the blocking stage.
+
+## Format Validation
+
+Validate your files locally before uploading:
 
 ```bash
-# From the project root
-python code/business_entity_resolution/src/pipeline.py
-```
-
-This will:
-1. Load and preprocess all source data
-2. Run blocking / candidate generation → `output/candidate_pairs.tsv`
-3. Extract features for candidate pairs
-4. Train/load matching model and predict → `output/matching_results.tsv`
-
-## Run Individual Steps
-
-```bash
-# Data inspection
-python inspect_data.py
-
-# Validation
 python utils/validate_submission.py \
     --matching output/matching_results.tsv \
     --candidate output/candidate_pairs.tsv \
     --test-dir dataset/test
-```
-
-## Project Structure
-
-```
-src/
-├── __init__.py       # Package init
-├── config.py         # Paths, constants, hyperparameters
-├── preprocess.py     # Data cleaning & normalization
-├── blocking.py       # Candidate generation / blocking strategies
-├── features.py       # Feature engineering for candidate pairs
-├── model.py          # Matching model training & inference
-├── evaluate.py       # F₀.₅ evaluation on validation split
-└── pipeline.py       # End-to-end orchestration
 ```

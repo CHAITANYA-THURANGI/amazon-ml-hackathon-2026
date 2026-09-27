@@ -15,6 +15,38 @@ from rapidfuzz import fuzz, distance
 
 _RE_NUM = re.compile(r"\b\d{2,6}\b")
 
+FEATURE_NAMES = [
+    "name_fuzz_ratio",
+    "name_token_sort",
+    "name_token_set",
+    "name_partial_ratio",
+    "name_lev_sim",
+    "name_jaro_winkler",
+    "name_lcs_sim",
+    "name_jaccard",
+    "name_dice",
+    "name_prefix_match",
+    "first_match",
+    "meta_match",
+    "soundex_match",
+    "n_len_diff",
+    "addr_fuzz_ratio",
+    "addr_token_sort",
+    "addr_token_set",
+    "addr_jaccard",
+    "addr_jaro_winkler",
+    "addr_lcs_sim",
+    "addr_len_diff",
+    "num_overlap",
+    "num_conflict",
+    "postal_match",
+    "comb_sort",
+    "comb_jacc",
+    "country_match",
+    "is_france",
+    "prior_confidence",
+]
+
 
 def extract_features_precomputed(
     s1_n: str, s1_a: str, s1_c: str, s1_p: str, s1_first: str, s1_meta: str, s1_soundex: str,

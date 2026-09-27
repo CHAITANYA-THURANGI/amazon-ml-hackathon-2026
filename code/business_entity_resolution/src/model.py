@@ -1,7 +1,10 @@
 """
-Matching Model module — GPU-accelerated XGBoost with automatic CPU fallback.
+Futuristic Entity Matching Ensemble Model: GPU XGBoost + LightGBM Blending.
 
-Optimizes decision threshold specifically for the competition metric (Macro F_0.5).
+Combines:
+1. GPU-accelerated XGBoost (depth-wise tree expansion on CUDA)
+2. LightGBM (leaf-wise tree expansion with histogram binning)
+3. Precision-calibrated Macro F_0.5 threshold optimization
 """
 
 import numpy as np
@@ -11,9 +14,15 @@ import joblib
 
 try:
     import xgboost as xgb
-    HAS_XGBOOST = True
+    HAS_XGB = True
 except ImportError:
-    HAS_XGBOOST = False
+    HAS_XGB = False
+
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except ImportError:
+    HAS_LGB = False
 
 from sklearn.ensemble import HistGradientBoostingClassifier
 from config import MODELS_DIR, RANDOM_SEED, DEFAULT_THRESHOLD, DEVICE_CONFIG
@@ -26,25 +35,28 @@ def compute_f05(precision: float, recall: float) -> float:
     return (1.25 * precision * recall) / (0.25 * precision + recall)
 
 
-class EntityMatchingModel:
-    """XGBoost entity matching classifier with GPU acceleration and CPU fallback."""
+class EntityMatchingEnsemble:
+    """High-performance dual ensemble (XGBoost GPU + LightGBM)."""
 
     def __init__(self, device: str = None, threshold: float = DEFAULT_THRESHOLD):
         self.threshold = threshold
         self.device = device or DEVICE_CONFIG["xgb_device"]
-        self.model = None
-        self._init_model()
+        self.xgb_model = None
+        self.lgb_model = None
+        self.weights = (0.6, 0.4)  # (XGBoost, LightGBM)
+        self._init_models()
 
-    def _init_model(self):
-        """Initialize XGBoost with GPU or fallback."""
-        if HAS_XGBOOST:
-            print(f"  Initializing XGBoost on device: {self.device.upper()}")
-            self.model = xgb.XGBClassifier(
-                n_estimators=300,
-                max_depth=6,
-                learning_rate=0.08,
-                subsample=0.8,
-                colsample_bytree=0.8,
+    def _init_models(self):
+        """Initialize both ensemble components."""
+        # 1. XGBoost Model (GPU-accelerated)
+        if HAS_XGB:
+            print(f"  Initializing XGBoost on device: {self.device.upper()}", flush=True)
+            self.xgb_model = xgb.XGBClassifier(
+                n_estimators=400,
+                max_depth=7,
+                learning_rate=0.07,
+                subsample=0.85,
+                colsample_bytree=0.85,
                 tree_method="hist",
                 device=self.device,
                 eval_metric="logloss",
@@ -52,50 +64,80 @@ class EntityMatchingModel:
                 n_jobs=-1 if self.device == "cpu" else 1,
             )
         else:
-            print("  XGBoost not found, using HistGradientBoostingClassifier (CPU)")
-            self.model = HistGradientBoostingClassifier(
-                max_iter=300,
-                max_depth=6,
-                learning_rate=0.08,
-                random_state=RANDOM_SEED,
+            self.xgb_model = HistGradientBoostingClassifier(
+                max_iter=300, max_depth=7, learning_rate=0.07, random_state=RANDOM_SEED
             )
 
+        # 2. LightGBM Model
+        if HAS_LGB:
+            print("  Initializing LightGBM (leaf-wise gradient boosting)", flush=True)
+            self.lgb_model = lgb.LGBMClassifier(
+                n_estimators=400,
+                num_leaves=63,
+                learning_rate=0.07,
+                subsample=0.85,
+                colsample_bytree=0.85,
+                random_state=RANDOM_SEED,
+                n_jobs=-1,
+                verbosity=-1,
+            )
+        else:
+            self.lgb_model = None
+
     def train(self, X: np.ndarray, y: np.ndarray):
-        """Train model with automatic device fallback if needed."""
-        print(f"  Training on {len(X):,} samples ({y.sum():,} positive, {len(y)-y.sum():,} negative)...")
+        """Train both models in the ensemble."""
+        pos = int(y.sum())
+        neg = len(y) - pos
+        print(f"  Training Ensemble on {len(X):,} candidate pairs ({pos:,} positive, {neg:,} negative)...", flush=True)
+
+        # Train XGBoost
+        print("  --> Fitting XGBoost (CUDA GPU)...", flush=True)
         try:
-            self.model.fit(X, y)
+            self.xgb_model.fit(X, y)
         except Exception as e:
             if self.device == "cuda":
-                print(f"  ⚠ GPU training encountered issue: {e}")
-                print("  Falling back to CPU...")
+                print(f"  ⚠ XGBoost GPU encountered: {e}. Falling back to CPU...", flush=True)
                 self.device = "cpu"
-                self._init_model()
-                self.model.fit(X, y)
+                self.xgb_model.set_params(device="cpu")
+                self.xgb_model.fit(X, y)
             else:
                 raise
-        print("  Model training completed!")
+
+        # Train LightGBM
+        if self.lgb_model is not None:
+            print("  --> Fitting LightGBM...", flush=True)
+            self.lgb_model.fit(X, y)
+
+        print("  Ensemble training complete!", flush=True)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Predict match probabilities."""
+        """Compute weighted blended probability from the ensemble."""
         if len(X) == 0:
             return np.array([])
-        return self.model.predict_proba(X)[:, 1]
+
+        p_xgb = self.xgb_model.predict_proba(X)[:, 1]
+
+        if self.lgb_model is not None:
+            p_lgb = self.lgb_model.predict_proba(X)[:, 1]
+            w_xgb, w_lgb = self.weights
+            return (w_xgb * p_xgb) + (w_lgb * p_lgb)
+
+        return p_xgb
 
     def predict(self, X: np.ndarray, threshold: float = None) -> np.ndarray:
-        """Predict binary matches based on threshold."""
+        """Predict binary matches based on precision-calibrated threshold."""
         th = threshold if threshold is not None else self.threshold
         proba = self.predict_proba(X)
         return (proba >= th).astype(int)
 
     def tune_threshold(self, X_val: np.ndarray, y_val: np.ndarray) -> float:
-        """Find the threshold that maximizes F_0.5 on validation data."""
-        print("  Tuning decision threshold for F_0.5...")
+        """Optimize threshold specifically to maximize Macro F_0.5."""
+        print("  Precision-calibrating decision threshold for Macro F_0.5...", flush=True)
         probas = self.predict_proba(X_val)
         best_th = self.threshold
         best_f05 = 0.0
 
-        for th in np.arange(0.30, 0.90, 0.05):
+        for th in np.arange(0.50, 0.92, 0.03):
             preds = (probas >= th).astype(int)
             tp = int(((preds == 1) & (y_val == 1)).sum())
             fp = int(((preds == 1) & (y_val == 0)).sum())
@@ -109,24 +151,33 @@ class EntityMatchingModel:
                 best_f05 = f05
                 best_th = float(th)
 
-        print(f"  Optimal threshold: {best_th:.2f} (Val F_0.5: {best_f05:.4f})")
+        print(f"  ★ Optimal Decision Threshold: {best_th:.2f} (Validation F_0.5: {best_f05:.4f})", flush=True)
         self.threshold = best_th
         return best_th
 
     def save(self, path: Path = None):
-        """Save model to disk."""
+        """Save ensemble state to disk."""
         if path is None:
             MODELS_DIR.mkdir(parents=True, exist_ok=True)
-            path = MODELS_DIR / "matching_model.joblib"
-        joblib.dump({"model": self.model, "threshold": self.threshold, "device": self.device}, path)
-        print(f"  Model saved to {path}")
+            path = MODELS_DIR / "matching_ensemble.joblib"
+        state = {
+            "xgb_model": self.xgb_model,
+            "lgb_model": self.lgb_model,
+            "weights": self.weights,
+            "threshold": self.threshold,
+            "device": self.device,
+        }
+        joblib.dump(state, path)
+        print(f"  Ensemble saved to {path}", flush=True)
 
     def load(self, path: Path = None):
-        """Load model from disk."""
+        """Load ensemble state from disk."""
         if path is None:
-            path = MODELS_DIR / "matching_model.joblib"
-        data = joblib.load(path)
-        self.model = data["model"]
-        self.threshold = data.get("threshold", DEFAULT_THRESHOLD)
-        self.device = data.get("device", "cpu")
-        print(f"  Model loaded from {path}")
+            path = MODELS_DIR / "matching_ensemble.joblib"
+        state = joblib.load(path)
+        self.xgb_model = state["xgb_model"]
+        self.lgb_model = state.get("lgb_model")
+        self.weights = state.get("weights", (0.6, 0.4))
+        self.threshold = state.get("threshold", DEFAULT_THRESHOLD)
+        self.device = state.get("device", "cpu")
+        print(f"  Ensemble loaded from {path}", flush=True)

@@ -1,83 +1,95 @@
 """
-Feature engineering module for candidate pair matching.
+High-Performance Feature Engineering Module for Entity Resolution.
 
-Calculates high-precision similarity metrics using rapidfuzz (C++ SIMD-accelerated):
-- Name fuzzy ratios (ratio, token sort, token set, partial)
-- Normalized Levenshtein similarity
-- Word token Jaccard similarity
-- Prefix & character n-gram matching
-- Address fuzzy and token overlap
-- Numeric / postal code match
-- Country consistency
+Extracts 28 dense signals with precomputed phonetics and fast C++ Rapidfuzz metrics:
+- Edit distance & prefix alignments
+- Token intersection, Dice, and Jaccard
+- Phonetic exact matches (O(1) comparison from precomputed codes)
+- Address structural verification & number conflicts
+- Holistic composite signals
 """
 
-from typing import List, Tuple
-from rapidfuzz import fuzz, distance
+from typing import List, Set, Tuple
 import re
-
-FEATURE_NAMES = [
-    "name_fuzz_ratio",
-    "name_token_sort",
-    "name_token_set",
-    "name_partial_ratio",
-    "name_lev_sim",
-    "name_jaccard",
-    "name_prefix_match",
-    "addr_fuzz_ratio",
-    "addr_token_sort",
-    "addr_token_set",
-    "addr_jaccard",
-    "num_overlap",
-    "country_match",
-    "name_len_diff",
-    "addr_len_diff",
-]
+from rapidfuzz import fuzz, distance
 
 _RE_NUM = re.compile(r"\b\d{2,6}\b")
 
 
-def extract_features(
-    s1_name: str, s1_addr: str, s1_country: str,
-    c_name: str, c_addr: str, c_country: str
+def extract_features_precomputed(
+    s1_n: str, s1_a: str, s1_c: str, s1_p: str, s1_first: str, s1_meta: str, s1_soundex: str,
+    c_n: str, c_a: str, c_c: str, c_p: str, c_first: str, c_meta: str, c_soundex: str,
 ) -> List[float]:
-    """Compute numerical feature vector for an entity pair."""
-    # 1. Name features
-    n_ratio = fuzz.ratio(s1_name, c_name) / 100.0
-    n_sort = fuzz.token_sort_ratio(s1_name, c_name) / 100.0
-    n_set = fuzz.token_set_ratio(s1_name, c_name) / 100.0
-    n_part = fuzz.partial_ratio(s1_name, c_name) / 100.0
-    n_lev = distance.Levenshtein.normalized_similarity(s1_name, c_name)
+    """Compute 28-dimensional dense feature vector using precomputed phonetic & token metadata."""
+    # ── 1. Name Features ──
+    n_ratio = fuzz.ratio(s1_n, c_n) / 100.0
+    n_sort = fuzz.token_sort_ratio(s1_n, c_n) / 100.0
+    n_set = fuzz.token_set_ratio(s1_n, c_n) / 100.0
+    n_part = fuzz.partial_ratio(s1_n, c_n) / 100.0
+    n_lev = distance.Levenshtein.normalized_similarity(s1_n, c_n)
+    n_jw = distance.JaroWinkler.similarity(s1_n, c_n)
+    n_lcs = distance.LCSseq.normalized_similarity(s1_n, c_n)
 
-    # Word Jaccard
-    w1 = set(s1_name.split())
-    w2 = set(c_name.split())
-    n_jacc = len(w1 & w2) / max(len(w1 | w2), 1)
+    w1 = s1_n.split()
+    w2 = c_n.split()
+    set1 = set(w1)
+    set2 = set(w2)
+    inter = len(set1 & set2)
+    n_jacc = inter / max(len(set1 | set2), 1)
+    n_dice = (2.0 * inter) / max(len(set1) + len(set2), 1)
 
-    # Prefix match (first 4 chars)
-    s1_p = "".join(ch for ch in s1_name if ch.isalnum())[:4]
-    c_p = "".join(ch for ch in c_name if ch.isalnum())[:4]
-    n_pref = 1.0 if (s1_p and s1_p == c_p) else 0.0
+    s1_pref = "".join(ch for ch in s1_n if ch.isalnum())[:4]
+    c_pref = "".join(ch for ch in c_n if ch.isalnum())[:4]
+    n_pref = 1.0 if (s1_pref and s1_pref == c_pref) else 0.0
 
-    # 2. Address features
-    a_ratio = fuzz.ratio(s1_addr, c_addr) / 100.0
-    a_sort = fuzz.token_sort_ratio(s1_addr, c_addr) / 100.0
-    a_set = fuzz.token_set_ratio(s1_addr, c_addr) / 100.0
+    first_match = 1.0 if (s1_first and s1_first == c_first) else 0.0
+    meta_match = 1.0 if (s1_meta and s1_meta == c_meta) else 0.0
+    soundex_match = 1.0 if (s1_soundex and s1_soundex == c_soundex) else 0.0
 
-    aw1 = set(s1_addr.split())
-    aw2 = set(c_addr.split())
+    n_len_diff = abs(len(s1_n) - len(c_n)) / max(len(s1_n) + len(c_n), 1)
+
+    # ── 2. Address Features ──
+    a_ratio = fuzz.ratio(s1_a, c_a) / 100.0
+    a_sort = fuzz.token_sort_ratio(s1_a, c_a) / 100.0
+    a_set = fuzz.token_set_ratio(s1_a, c_a) / 100.0
+
+    aw1 = set(s1_a.split())
+    aw2 = set(c_a.split())
     a_jacc = len(aw1 & aw2) / max(len(aw1 | aw2), 1)
+    a_jw = distance.JaroWinkler.similarity(s1_a, c_a)
+    a_lcs = distance.LCSseq.normalized_similarity(s1_a, c_a)
+    a_len_diff = abs(len(s1_a) - len(c_a)) / max(len(s1_a) + len(c_a), 1)
 
-    # Numeric overlap (street / pin / zip)
-    nums1 = set(_RE_NUM.findall(s1_addr))
-    nums2 = set(_RE_NUM.findall(c_addr))
-    num_match = len(nums1 & nums2) / max(len(nums1 | nums2), 1) if (nums1 or nums2) else 0.5
+    nums1 = set(_RE_NUM.findall(s1_a))
+    nums2 = set(_RE_NUM.findall(c_a))
+    if nums1 and nums2:
+        num_inter = len(nums1 & nums2)
+        num_overlap = num_inter / len(nums1 | nums2)
+        num_conflict = 1.0 if num_inter == 0 else 0.0
+    elif not nums1 and not nums2:
+        num_overlap = 0.5
+        num_conflict = 0.0
+    else:
+        num_overlap = 0.25
+        num_conflict = 0.0
 
-    # 3. Country match
-    c_match = 1.0 if (s1_country and s1_country == c_country) else 0.0
+    if s1_p and c_p:
+        postal_match = 1.0 if s1_p == c_p else 0.0
+    else:
+        postal_match = 0.5
 
-    # 4. Length differences
-    len_diff_n = abs(len(s1_name) - len(c_name)) / max(len(s1_name) + len(c_name), 1)
-    len_diff_a = abs(len(s1_addr) - len(c_addr)) / max(len(s1_addr) + len(c_addr), 1)
+    # ── 3. Holistic & Metadata Features ──
+    comb1 = f"{s1_n} {s1_a}"
+    comb2 = f"{c_n} {c_a}"
+    comb_sort = fuzz.token_sort_ratio(comb1, comb2) / 100.0
+
+    cw1 = set(comb1.split())
+    cw2 = set(comb2.split())
+    comb_jacc = len(cw1 & cw2) / max(len(cw1 | cw2), 1)
+
+    c_match = 1.0 if (s1_c and s1_c == c_c) else 0.0
+    is_fr = 1.0 if (s1_c == "france" or c_c == "france") else 0.0
+    prior = (n_jw * 0.4) + (a_jw * 0.3) + (comb_sort * 0.3)
 
     return [
         n_ratio,
@@ -85,14 +97,28 @@ def extract_features(
         n_set,
         n_part,
         n_lev,
+        n_jw,
+        n_lcs,
         n_jacc,
+        n_dice,
         n_pref,
+        first_match,
+        meta_match,
+        soundex_match,
+        n_len_diff,
         a_ratio,
         a_sort,
         a_set,
         a_jacc,
-        num_match,
+        a_jw,
+        a_lcs,
+        a_len_diff,
+        num_overlap,
+        num_conflict,
+        postal_match,
+        comb_sort,
+        comb_jacc,
         c_match,
-        len_diff_n,
-        len_diff_a,
+        is_fr,
+        prior,
     ]

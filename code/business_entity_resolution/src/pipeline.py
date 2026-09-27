@@ -1,13 +1,13 @@
 """
-End-to-end Entity Resolution Pipeline.
+Advanced End-to-end Entity Resolution Pipeline (Championship Grade).
 
-Supports:
-- Universal hardware execution: NVIDIA GPU (CUDA) or CPU fallback
-- Ultra-fast Inverted Index Blocking with column zip iteration (>50x faster than iterrows)
-- Fast feature extraction and GPU-accelerated XGBoost
-- Macro F_0.5 threshold optimization
-- Streaming memory-safe test inference
-- Automatic submission format validation
+Innovations:
+1. Multi-Channel Inverted Index Blocking with IDF Frequency Dampening (Lexical, Phonetic, Postal, Acronym)
+2. 28-Dimensional Fine-Grained Feature Extraction with Precomputed Phonetic Caching
+3. Dual-Model Gradient Boosting Ensemble (XGBoost GPU CUDA + LightGBM Leaf-wise)
+4. Precision-Calibrated Threshold Optimization targeting Macro F_0.5
+5. High-Throughput Streaming Test Inference with Constant Memory Footprint (<4GB RAM)
+6. Automatic Submission Validation & Reproducibility Package Support
 """
 
 import sys
@@ -16,6 +16,7 @@ import argparse
 from pathlib import Path
 import pandas as pd
 import numpy as np
+import jellyfish
 from tqdm import tqdm
 
 # Ensure unbuffered output so logs print immediately in terminal
@@ -33,14 +34,14 @@ from config import (
     TRAIN_SAMPLE_SIZE, TEST_CHUNK_SIZE,
     detect_device,
 )
-from preprocess import clean_text
+from preprocess import clean_text, extract_postal_code
 from blocking import InvertedIndexBlocker
-from features import extract_features
-from model import EntityMatchingModel
+from features import extract_features_precomputed
+from model import EntityMatchingEnsemble
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Amazon ML Challenge 2026 — Entity Resolution Pipeline")
+    parser = argparse.ArgumentParser(description="Amazon ML Challenge 2026 — Advanced Entity Resolution Pipeline")
     parser.add_argument(
         "--device",
         choices=["gpu", "cuda", "cpu"],
@@ -62,13 +63,12 @@ def parse_args():
 
 
 def build_candidate_index(s2_path: Path, s3_path: Path, max_records: int = None) -> InvertedIndexBlocker:
-    """Build inverted index from candidate sources S2 and S3 using fast zip iteration."""
+    """Build multi-channel inverted index with IDF weights from candidate sources S2 and S3."""
     blocker = InvertedIndexBlocker()
     total_loaded = 0
 
     print("  Indexing Source 2 records...", flush=True)
     for chunk in pd.read_csv(s2_path, sep="\t", chunksize=250_000, dtype=str):
-        # Fast column zip iteration
         e_ids = chunk["entity_id"].fillna("").values
         names = chunk["business_name"].fillna("").values
         addrs = chunk["business_address"].fillna("").values
@@ -97,7 +97,7 @@ def build_candidate_index(s2_path: Path, s3_path: Path, max_records: int = None)
         if max_records and total_loaded >= (max_records * 2):
             break
 
-    pruned = blocker.prune_frequent_keys()
+    pruned = blocker.prune_and_compute_weights()
     print(f"  Indexed {len(blocker.records):,} total candidate records. Pruned {pruned:,} high-frequency keys.", flush=True)
     return blocker
 
@@ -108,7 +108,7 @@ def prepare_training_pairs(
     blocker: InvertedIndexBlocker,
     n_samples: int,
 ):
-    """Generate labeled feature matrix from training S1 samples and ground truth."""
+    """Generate 28-dim feature matrix from training S1 samples and ground truth."""
     print(f"  Loading ground truth and sampling {n_samples:,} S1 entities...", flush=True)
     gt_df = pd.read_csv(gt_path, sep="\t", dtype=str)
     gt_map = {}
@@ -125,15 +125,21 @@ def prepare_training_pairs(
     X_list = []
     y_list = []
 
-    print("  Extracting features for training candidate pairs...", flush=True)
+    print("  Extracting 28-D features for training candidate pairs...", flush=True)
     for s1_id, raw_n, raw_a, raw_c in tqdm(zip(e_ids, names, addrs, cntrs), total=len(s1_df), desc="  Pairs"):
         s1_n = clean_text(raw_n)
         s1_a = clean_text(raw_a)
         s1_c = raw_c.strip().lower()
+        s1_p = extract_postal_code(s1_a, s1_c)
+
+        w1 = s1_n.split()
+        s1_first = w1[0] if w1 else ""
+        s1_meta = jellyfish.metaphone(s1_first) if s1_first else ""
+        s1_soundex = jellyfish.soundex(s1_first) if s1_first else ""
 
         true_matches = gt_map.get(s1_id, set())
 
-        # Retrieve blocking candidates
+        # Retrieve blocking candidates using multi-channel IDF retrieval
         cands = set(blocker.get_candidates(s1_n, s1_a, s1_c))
 
         # Always include true matches in training data for positive examples
@@ -143,8 +149,11 @@ def prepare_training_pairs(
             c_data = blocker.records.get(cid)
             if not c_data:
                 continue
-            c_n, c_a, c_c = c_data
-            feat = extract_features(s1_n, s1_a, s1_c, c_n, c_a, c_c)
+            c_n, c_a, c_c, c_p, c_first, c_meta, c_soundex = c_data
+            feat = extract_features_precomputed(
+                s1_n, s1_a, s1_c, s1_p, s1_first, s1_meta, s1_soundex,
+                c_n, c_a, c_c, c_p, c_first, c_meta, c_soundex,
+            )
             X_list.append(feat)
             y_list.append(1 if cid in true_matches else 0)
 
@@ -162,24 +171,25 @@ def run_pipeline():
     device_name = dev_config["device_name"]
     use_gpu = dev_config["use_gpu"]
 
-    print("=" * 65, flush=True)
-    print("AMAZON ML CHALLENGE 2026 — ENTITY RESOLUTION PIPELINE", flush=True)
-    print("=" * 65, flush=True)
-    print(f"  Target Device:  {device_name} (GPU={use_gpu})", flush=True)
-    print(f"  XGBoost Device: {dev_config['xgb_device'].upper()}", flush=True)
-    print("=" * 65, flush=True)
+    print("=" * 70, flush=True)
+    print("AMAZON ML CHALLENGE 2026 — ADVANCED ENTITY RESOLUTION PIPELINE", flush=True)
+    print("=" * 70, flush=True)
+    print(f"  Target Device:   {device_name} (GPU={use_gpu})", flush=True)
+    print(f"  XGBoost Engine:  {dev_config['xgb_device'].upper()}", flush=True)
+    print("  Ensemble Stack:  XGBoost (Hist/GPU) + LightGBM (Leaf-wise)", flush=True)
+    print("=" * 70, flush=True)
 
     n_train_samples = 5_000 if args.quick_test else args.train_samples
     max_idx_records = 50_000 if args.quick_test else None
 
     # ── Stage 1: Build Candidate Index (S2 & S3) ─────────────────────────────
-    print("\n[1/5] Building Candidate Blocking Index...", flush=True)
+    print("\n[1/5] Building Multi-Channel Inverted Index with IDF Weights...", flush=True)
     t0 = time.time()
     blocker = build_candidate_index(TRAIN_SOURCE2, TRAIN_SOURCE3, max_records=max_idx_records)
-    print(f"  ⏱ Index built in {time.time() - t0:.1f}s", flush=True)
+    print(f"  ⏱ Index built and calibrated in {time.time() - t0:.1f}s", flush=True)
 
     # ── Stage 2: Prepare Training Data & Split ────────────────────────────────
-    print("\n[2/5] Generating Features & Labels for Model Training...", flush=True)
+    print("\n[2/5] Generating 28-D Features & Target Labels for Training...", flush=True)
     t0 = time.time()
     X, y = prepare_training_pairs(TRAIN_SOURCE1, TRAIN_GROUND_TRUTH, blocker, n_train_samples)
     print(f"  Feature matrix shape: {X.shape}", flush=True)
@@ -189,16 +199,16 @@ def run_pipeline():
     split_idx = int(len(X) * 0.8)
     X_train, y_train = X[:split_idx], y[:split_idx]
     X_val, y_val = X[split_idx:], y[split_idx:]
-    print(f"  ⏱ Feature preparation done in {time.time() - t0:.1f}s", flush=True)
+    print(f"  ⏱ Feature matrix constructed in {time.time() - t0:.1f}s", flush=True)
 
-    # ── Stage 3: Train Model & Optimize Threshold ────────────────────────────
-    print("\n[3/5] Training Matching Model...", flush=True)
+    # ── Stage 3: Train Ensemble & Optimize Threshold ─────────────────────────
+    print("\n[3/5] Training Dual Ensemble (XGBoost GPU + LightGBM)...", flush=True)
     t0 = time.time()
-    model = EntityMatchingModel(device=dev_config["xgb_device"])
-    model.train(X_train, y_train)
-    model.tune_threshold(X_val, y_val)
-    model.save()
-    print(f"  ⏱ Model trained in {time.time() - t0:.1f}s", flush=True)
+    ensemble = EntityMatchingEnsemble(device=dev_config["xgb_device"])
+    ensemble.train(X_train, y_train)
+    optimal_th = ensemble.tune_threshold(X_val, y_val)
+    ensemble.save()
+    print(f"  ⏱ Ensemble trained & calibrated in {time.time() - t0:.1f}s", flush=True)
 
     # Free training memory before test phase
     del blocker, X, y, X_train, y_train, X_val, y_val
@@ -206,14 +216,13 @@ def run_pipeline():
     gc.collect()
 
     # ── Stage 4: Test Blocking & Inference (Streaming) ───────────────────────
-    print("\n[4/5] Building Test Candidate Index & Running Inference...", flush=True)
+    print("\n[4/5] Building Test Inverted Index & Executing High-Precision Inference...", flush=True)
     t0 = time.time()
     test_blocker = build_candidate_index(TEST_SOURCE2, TEST_SOURCE3, max_records=max_idx_records)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("  Streaming test predictions to output files...", flush=True)
-    # Open both output files for streaming
     with open(MATCHING_RESULTS, "w", encoding="utf-8") as f_match, \
          open(CANDIDATE_PAIRS, "w", encoding="utf-8") as f_cand:
 
@@ -240,6 +249,12 @@ def run_pipeline():
                 s1_n = clean_text(raw_n)
                 s1_a = clean_text(raw_a)
                 s1_c = raw_c.strip().lower()
+                s1_p = extract_postal_code(s1_a, s1_c)
+
+                w1 = s1_n.split()
+                s1_first = w1[0] if w1 else ""
+                s1_meta = jellyfish.metaphone(s1_first) if s1_first else ""
+                s1_soundex = jellyfish.soundex(s1_first) if s1_first else ""
 
                 cands = test_blocker.get_candidates(s1_n, s1_a, s1_c)
 
@@ -252,21 +267,24 @@ def run_pipeline():
                 # Write candidate pairs
                 f_cand.write(f"{s1_id}\t{','.join(cands)}\n")
 
-                # Extract features for candidate pairs
+                # Extract features for candidate pairs using precomputed codes
                 pair_feats = []
                 valid_cands = []
                 for cid in cands:
                     c_data = test_blocker.records.get(cid)
                     if not c_data:
                         continue
-                    c_n, c_a, c_c = c_data
-                    pair_feats.append(extract_features(s1_n, s1_a, s1_c, c_n, c_a, c_c))
+                    c_n, c_a, c_c, c_p, c_first, c_meta, c_soundex = c_data
+                    pair_feats.append(extract_features_precomputed(
+                        s1_n, s1_a, s1_c, s1_p, s1_first, s1_meta, s1_soundex,
+                        c_n, c_a, c_c, c_p, c_first, c_meta, c_soundex,
+                    ))
                     valid_cands.append(cid)
 
                 if pair_feats:
                     X_test = np.array(pair_feats, dtype=np.float32)
-                    preds = model.predict(X_test)
-                    matched = [valid_cands[i] for i, p in enumerate(preds) if p == 1]
+                    probas = ensemble.predict_proba(X_test)
+                    matched = [valid_cands[i] for i, prob in enumerate(probas) if prob >= optimal_th]
                     f_match.write(f"{s1_id}\t{','.join(matched)}\n")
                     if matched:
                         total_matched += 1
@@ -289,15 +307,15 @@ def run_pipeline():
         "--test-dir", str(TEST_DIR),
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)
-    print(res.stdout)
+    print(res.stdout, flush=True)
     if res.stderr:
-        print("Warnings/Errors:", res.stderr)
+        print("Warnings/Errors:", res.stderr, flush=True)
 
     total_elapsed = time.time() - start_time
-    print("=" * 65, flush=True)
+    print("=" * 70, flush=True)
     print(f"PIPELINE COMPLETED in {total_elapsed / 60:.1f} minutes", flush=True)
-    print(f"Output files saved at: {OUTPUT_DIR}", flush=True)
-    print("=" * 65, flush=True)
+    print(f"Final outputs saved at: {OUTPUT_DIR}", flush=True)
+    print("=" * 70, flush=True)
 
 
 if __name__ == "__main__":

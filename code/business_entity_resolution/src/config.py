@@ -1,13 +1,17 @@
 """
-Configuration module — paths, constants, and hyperparameters.
+Configuration module — paths, constants, device detection, and hyperparameters.
 
-All paths are relative to the project root (amazon-ml-challenge-2026/).
+Supports:
+- Universal execution: NVIDIA GPU (CUDA) or CPU fallback
+- Memory-safe streaming and batch sizes
+- All competition paths and evaluation constants
 """
 
 from pathlib import Path
+import os
+import argparse
 
 # ─── Project Root ────────────────────────────────────────────────────────────
-# Resolve from this file: src/ → business_entity_resolution/ → code/ → root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 # ─── Dataset Paths ───────────────────────────────────────────────────────────
@@ -42,15 +46,80 @@ SOURCE1_ENTITY_ID_COL = "source1_entity_id"
 MATCHED_ENTITY_IDS_COL = "matched_entity_ids"
 CANDIDATE_ENTITY_IDS_COL = "candidate_entity_ids"
 
-# ─── Hyperparameters (tune these) ────────────────────────────────────────────
-# Blocking
-BLOCKING_TOP_K = 50               # Max candidates per S1 entity from each blocking key
-TFIDF_NGRAM_RANGE = (2, 4)        # Character n-gram range for TF-IDF
-TFIDF_TOP_K = 100                 # Top-K similar candidates from TF-IDF
+# ─── Device Detection (Universal GPU + CPU Fallback) ─────────────────────────
 
-# Matching threshold
-MATCH_THRESHOLD = 0.5             # Probability threshold for final match decision
+def detect_device(force_device: str = None) -> dict:
+    """
+    Detect the compute device (GPU or CPU).
 
-# Validation
-VAL_SPLIT_RATIO = 0.2             # Fraction of training data for validation
+    Args:
+        force_device: 'gpu', 'cuda', or 'cpu' to override auto-detection.
+
+    Returns:
+        dict with device settings.
+    """
+    if force_device:
+        force_device = force_device.lower()
+        if force_device in ("cpu",):
+            return {
+                "use_gpu": False,
+                "xgb_device": "cpu",
+                "torch_device": "cpu",
+                "device_name": "CPU (Forced)",
+            }
+
+    # Auto-detect CUDA GPU
+    use_gpu = False
+    device_name = "CPU"
+    xgb_device = "cpu"
+    torch_device = "cpu"
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            use_gpu = True
+            device_name = torch.cuda.get_device_name(0)
+            torch_device = "cuda"
+            xgb_device = "cuda"
+    except ImportError:
+        pass
+
+    if not use_gpu:
+        try:
+            import xgboost as xgb
+            if xgb.build_info().get("USE_CUDA", False):
+                use_gpu = True
+                xgb_device = "cuda"
+                device_name = "CUDA (via XGBoost)"
+        except Exception:
+            pass
+
+    return {
+        "use_gpu": use_gpu,
+        "xgb_device": xgb_device,
+        "torch_device": torch_device,
+        "device_name": device_name,
+    }
+
+
+DEVICE_CONFIG = detect_device()
+USE_GPU = DEVICE_CONFIG["use_gpu"]
+XGB_DEVICE = DEVICE_CONFIG["xgb_device"]
+TORCH_DEVICE = DEVICE_CONFIG["torch_device"]
+
+# ─── Pipeline Hyperparameters ────────────────────────────────────────────────
+# Scale parameters for memory-safe execution on laptop
+TRAIN_SAMPLE_SIZE = 60_000        # Number of S1 training records to sample for model training
+VAL_SAMPLE_SIZE = 10_000          # Number of S1 validation records for threshold tuning
+TEST_CHUNK_SIZE = 100_000         # Process test set in streaming chunks of S1 entities
+
+# Blocking parameters
+MAX_CANDIDATES_PER_KEY = 300      # Prune ultra-frequent keys (e.g. 'hotel', 'services')
+MAX_CANDIDATES_PER_S1 = 30        # Top candidate pairs per S1 record
+
+# Matching threshold (F0.5 favors precision: default 0.65, auto-tuned during training)
+DEFAULT_THRESHOLD = 0.65
+
+# CPU parallelism
+N_WORKERS = max(1, os.cpu_count() - 1) if os.cpu_count() else 4
 RANDOM_SEED = 42

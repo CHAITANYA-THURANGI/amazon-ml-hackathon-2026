@@ -1,13 +1,13 @@
 """
-Matching model — training and inference for entity resolution.
+Matching Model module — GPU-accelerated XGBoost with automatic CPU fallback.
 
-Uses a binary classifier (XGBoost by default) to score candidate pairs
-and determine which ones are true matches.
+Optimizes decision threshold specifically for the competition metric (Macro F_0.5).
 """
 
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import joblib
 
 try:
     import xgboost as xgb
@@ -15,112 +15,118 @@ try:
 except ImportError:
     HAS_XGBOOST = False
 
-try:
-    import lightgbm as lgb
-    HAS_LIGHTGBM = True
-except ImportError:
-    HAS_LIGHTGBM = False
-
-from sklearn.ensemble import GradientBoostingClassifier
-from config import MATCH_THRESHOLD, MODELS_DIR, RANDOM_SEED
+from sklearn.ensemble import HistGradientBoostingClassifier
+from config import MODELS_DIR, RANDOM_SEED, DEFAULT_THRESHOLD, DEVICE_CONFIG
 
 
-class MatchingModel:
-    """Binary classifier for entity matching."""
+def compute_f05(precision: float, recall: float) -> float:
+    """Compute F_0.5 score."""
+    if precision + recall == 0:
+        return 0.0
+    return (1.25 * precision * recall) / (0.25 * precision + recall)
 
-    def __init__(self, model_type: str = "xgboost", threshold: float = MATCH_THRESHOLD):
-        self.model_type = model_type
+
+class EntityMatchingModel:
+    """XGBoost entity matching classifier with GPU acceleration and CPU fallback."""
+
+    def __init__(self, device: str = None, threshold: float = DEFAULT_THRESHOLD):
         self.threshold = threshold
+        self.device = device or DEVICE_CONFIG["xgb_device"]
         self.model = None
-        self._build_model()
+        self._init_model()
 
-    def _build_model(self):
-        """Initialize the underlying model."""
-        if self.model_type == "xgboost" and HAS_XGBOOST:
+    def _init_model(self):
+        """Initialize XGBoost with GPU or fallback."""
+        if HAS_XGBOOST:
+            print(f"  Initializing XGBoost on device: {self.device.upper()}")
             self.model = xgb.XGBClassifier(
-                n_estimators=500,
+                n_estimators=300,
                 max_depth=6,
-                learning_rate=0.1,
+                learning_rate=0.08,
                 subsample=0.8,
                 colsample_bytree=0.8,
-                scale_pos_weight=1.0,  # Adjust based on class imbalance
+                tree_method="hist",
+                device=self.device,
                 eval_metric="logloss",
                 random_state=RANDOM_SEED,
-                n_jobs=-1,
-            )
-        elif self.model_type == "lightgbm" and HAS_LIGHTGBM:
-            self.model = lgb.LGBMClassifier(
-                n_estimators=500,
-                max_depth=6,
-                learning_rate=0.1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=RANDOM_SEED,
-                n_jobs=-1,
-                verbose=-1,
+                n_jobs=-1 if self.device == "cpu" else 1,
             )
         else:
-            # Fallback to sklearn
-            print(f"  Using sklearn GradientBoosting (install xgboost/lightgbm for better performance)")
-            self.model = GradientBoostingClassifier(
-                n_estimators=200,
-                max_depth=5,
-                learning_rate=0.1,
-                subsample=0.8,
+            print("  XGBoost not found, using HistGradientBoostingClassifier (CPU)")
+            self.model = HistGradientBoostingClassifier(
+                max_iter=300,
+                max_depth=6,
+                learning_rate=0.08,
                 random_state=RANDOM_SEED,
             )
 
     def train(self, X: np.ndarray, y: np.ndarray):
-        """
-        Train the matching model.
-
-        Args:
-            X: Feature matrix (n_pairs, n_features)
-            y: Binary labels (1 = match, 0 = non-match)
-        """
-        print(f"  Training {self.model_type} model...")
-        print(f"  Samples: {len(y):,} | Positive: {y.sum():,} ({y.mean():.2%})")
-        self.model.fit(X, y)
-        print("  Training complete.")
+        """Train model with automatic device fallback if needed."""
+        print(f"  Training on {len(X):,} samples ({y.sum():,} positive, {len(y)-y.sum():,} negative)...")
+        try:
+            self.model.fit(X, y)
+        except Exception as e:
+            if self.device == "cuda":
+                print(f"  ⚠ GPU training encountered issue: {e}")
+                print("  Falling back to CPU...")
+                self.device = "cpu"
+                self._init_model()
+                self.model.fit(X, y)
+            else:
+                raise
+        print("  Model training completed!")
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return match probabilities for candidate pairs."""
+        """Predict match probabilities."""
+        if len(X) == 0:
+            return np.array([])
         return self.model.predict_proba(X)[:, 1]
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Return binary match predictions based on threshold."""
+    def predict(self, X: np.ndarray, threshold: float = None) -> np.ndarray:
+        """Predict binary matches based on threshold."""
+        th = threshold if threshold is not None else self.threshold
         proba = self.predict_proba(X)
-        return (proba >= self.threshold).astype(int)
+        return (proba >= th).astype(int)
 
-    def feature_importance(self, feature_names: list) -> pd.DataFrame:
-        """Return feature importances sorted descending."""
-        if hasattr(self.model, "feature_importances_"):
-            imp = self.model.feature_importances_
-        else:
-            return pd.DataFrame()
+    def tune_threshold(self, X_val: np.ndarray, y_val: np.ndarray) -> float:
+        """Find the threshold that maximizes F_0.5 on validation data."""
+        print("  Tuning decision threshold for F_0.5...")
+        probas = self.predict_proba(X_val)
+        best_th = self.threshold
+        best_f05 = 0.0
 
-        df = pd.DataFrame({
-            "feature": feature_names,
-            "importance": imp,
-        }).sort_values("importance", ascending=False)
+        for th in np.arange(0.30, 0.90, 0.05):
+            preds = (probas >= th).astype(int)
+            tp = int(((preds == 1) & (y_val == 1)).sum())
+            fp = int(((preds == 1) & (y_val == 0)).sum())
+            fn = int(((preds == 0) & (y_val == 1)).sum())
 
-        return df
+            prec = tp / max(tp + fp, 1)
+            rec = tp / max(tp + fn, 1)
+            f05 = compute_f05(prec, rec)
+
+            if f05 > best_f05:
+                best_f05 = f05
+                best_th = float(th)
+
+        print(f"  Optimal threshold: {best_th:.2f} (Val F_0.5: {best_f05:.4f})")
+        self.threshold = best_th
+        return best_th
 
     def save(self, path: Path = None):
         """Save model to disk."""
         if path is None:
             MODELS_DIR.mkdir(parents=True, exist_ok=True)
-            path = MODELS_DIR / f"matching_model_{self.model_type}.pkl"
-
-        import joblib
-        joblib.dump(self.model, path)
+            path = MODELS_DIR / "matching_model.joblib"
+        joblib.dump({"model": self.model, "threshold": self.threshold, "device": self.device}, path)
         print(f"  Model saved to {path}")
 
     def load(self, path: Path = None):
         """Load model from disk."""
         if path is None:
-            path = MODELS_DIR / f"matching_model_{self.model_type}.pkl"
-
-        import joblib
-        self.model = joblib.load(path)
+            path = MODELS_DIR / "matching_model.joblib"
+        data = joblib.load(path)
+        self.model = data["model"]
+        self.threshold = data.get("threshold", DEFAULT_THRESHOLD)
+        self.device = data.get("device", "cpu")
         print(f"  Model loaded from {path}")

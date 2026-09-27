@@ -130,28 +130,53 @@ class EntityMatchingEnsemble:
         proba = self.predict_proba(X)
         return (proba >= th).astype(int)
 
-    def tune_threshold(self, X_val: np.ndarray, y_val: np.ndarray) -> float:
+    def tune_threshold(self, X_val: np.ndarray, y_val: np.ndarray, entity_groups: list = None) -> float:
         """Optimize threshold specifically to maximize Macro F_0.5."""
         print("  Precision-calibrating decision threshold for Macro F_0.5...", flush=True)
         probas = self.predict_proba(X_val)
-        best_th = self.threshold
+        best_th = 0.55
         best_f05 = 0.0
 
-        for th in np.arange(0.50, 0.92, 0.03):
-            preds = (probas >= th).astype(int)
-            tp = int(((preds == 1) & (y_val == 1)).sum())
-            fp = int(((preds == 1) & (y_val == 0)).sum())
-            fn = int(((preds == 0) & (y_val == 1)).sum())
+        if entity_groups is not None:
+            # Group pairs by entity for true Macro F_0.5 computation
+            from collections import defaultdict
+            entity_cand_map = defaultdict(list)
+            for idx, eid in enumerate(entity_groups):
+                entity_cand_map[eid].append((probas[idx], y_val[idx]))
 
-            prec = tp / max(tp + fp, 1)
-            rec = tp / max(tp + fn, 1)
-            f05 = compute_f05(prec, rec)
+            for th in np.arange(0.40, 0.85, 0.025):
+                scores = []
+                for eid, items in entity_cand_map.items():
+                    actual_pos = sum(1 for _, y in items if y == 1)
+                    pred_pos = sum(1 for p, _ in items if p >= th)
+                    tp = sum(1 for p, y in items if p >= th and y == 1)
 
-            if f05 > best_f05:
-                best_f05 = f05
-                best_th = float(th)
+                    if actual_pos == 0:
+                        scores.append(1.0 if pred_pos == 0 else 0.0)
+                    else:
+                        p = tp / pred_pos if pred_pos > 0 else 0.0
+                        r = tp / actual_pos if actual_pos > 0 else 0.0
+                        scores.append(compute_f05(p, r))
 
-        print(f"  ★ Optimal Decision Threshold: {best_th:.2f} (Validation F_0.5: {best_f05:.4f})", flush=True)
+                m_f05 = float(np.mean(scores))
+                if m_f05 > best_f05:
+                    best_f05 = m_f05
+                    best_th = float(th)
+        else:
+            # Fallback to balanced F_0.5 search
+            for th in np.arange(0.45, 0.80, 0.025):
+                preds = (probas >= th).astype(int)
+                tp = int(((preds == 1) & (y_val == 1)).sum())
+                fp = int(((preds == 1) & (y_val == 0)).sum())
+                fn = int(((preds == 0) & (y_val == 1)).sum())
+                prec = tp / max(tp + fp, 1)
+                rec = tp / max(tp + fn, 1)
+                f05 = compute_f05(prec, rec)
+                if f05 > best_f05:
+                    best_f05 = f05
+                    best_th = float(th)
+
+        print(f"  ★ Optimal Decision Threshold: {best_th:.4f} (Validation Macro F_0.5: {best_f05:.4f})", flush=True)
         self.threshold = best_th
         return best_th
 

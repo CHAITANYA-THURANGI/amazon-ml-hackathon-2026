@@ -124,6 +124,7 @@ def prepare_training_pairs(
 
     X_list = []
     y_list = []
+    entity_list = []
 
     print("  Extracting 28-D features for training candidate pairs...", flush=True)
     for s1_id, raw_n, raw_a, raw_c in tqdm(zip(e_ids, names, addrs, cntrs), total=len(s1_df), desc="  Pairs"):
@@ -156,10 +157,11 @@ def prepare_training_pairs(
             )
             X_list.append(feat)
             y_list.append(1 if cid in true_matches else 0)
+            entity_list.append(s1_id)
 
     X = np.array(X_list, dtype=np.float32)
     y = np.array(y_list, dtype=np.int32)
-    return X, y
+    return X, y, entity_list
 
 
 def run_pipeline():
@@ -191,7 +193,7 @@ def run_pipeline():
     # ── Stage 2: Prepare Training Data & Split ────────────────────────────────
     print("\n[2/5] Generating 28-D Features & Target Labels for Training...", flush=True)
     t0 = time.time()
-    X, y = prepare_training_pairs(TRAIN_SOURCE1, TRAIN_GROUND_TRUTH, blocker, n_train_samples)
+    X, y, entity_list = prepare_training_pairs(TRAIN_SOURCE1, TRAIN_GROUND_TRUTH, blocker, n_train_samples)
     print(f"  Feature matrix shape: {X.shape}", flush=True)
     print(f"  Positive pairs: {y.sum():,} ({y.mean():.2%}) | Negative pairs: {len(y)-y.sum():,}", flush=True)
 
@@ -199,6 +201,7 @@ def run_pipeline():
     split_idx = int(len(X) * 0.8)
     X_train, y_train = X[:split_idx], y[:split_idx]
     X_val, y_val = X[split_idx:], y[split_idx:]
+    val_eids = entity_list[split_idx:]
     print(f"  ⏱ Feature matrix constructed in {time.time() - t0:.1f}s", flush=True)
 
     # ── Stage 3: Train Ensemble & Optimize Threshold ─────────────────────────
@@ -206,7 +209,7 @@ def run_pipeline():
     t0 = time.time()
     ensemble = EntityMatchingEnsemble(device=dev_config["xgb_device"])
     ensemble.train(X_train, y_train)
-    optimal_th = ensemble.tune_threshold(X_val, y_val)
+    optimal_th = ensemble.tune_threshold(X_val, y_val, entity_groups=val_eids)
     ensemble.save()
     print(f"  ⏱ Ensemble trained & calibrated in {time.time() - t0:.1f}s", flush=True)
 
@@ -285,6 +288,11 @@ def run_pipeline():
                     X_test = np.array(pair_feats, dtype=np.float32)
                     probas = ensemble.predict_proba(X_test)
                     matched = [valid_cands[i] for i, prob in enumerate(probas) if prob >= optimal_th]
+                    # High-confidence fallback for borderline true matches (prevents 0.0 recall drop on non-singletons)
+                    if not matched and len(probas) > 0 and probas.max() >= 0.42:
+                        top_idx = int(np.argmax(probas))
+                        matched = [valid_cands[top_idx]]
+
                     f_match.write(f"{s1_id}\t{','.join(matched)}\n")
                     if matched:
                         total_matched += 1

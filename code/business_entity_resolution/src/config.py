@@ -114,11 +114,13 @@ VAL_SAMPLE_SIZE = 10_000          # Number of S1 validation records for threshol
 TEST_CHUNK_SIZE = 100_000         # Process test set in streaming chunks of S1 entities
 
 # Blocking parameters
-MAX_CANDIDATES_PER_KEY = 300      # Prune ultra-frequent keys (e.g. 'hotel', 'services')
-MAX_CANDIDATES_PER_S1 = 30        # Top candidate pairs per S1 record
+MAX_CANDIDATES_PER_S1 = 35        # Top candidate pairs per S1 record
 
-# Matching threshold (F0.5 favors precision: default 0.65, auto-tuned during training)
-DEFAULT_THRESHOLD = 0.65
+# Matching threshold (F0.5 favors precision: default 0.55, auto-tuned during training)
+DEFAULT_THRESHOLD = 0.55
+
+# Validation split
+VAL_SPLIT_RATIO = 0.2
 
 # CPU parallelism
 N_WORKERS = max(1, os.cpu_count() - 1) if os.cpu_count() else 4
